@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package restore
+package importer
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -31,22 +30,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	sstpb "github.com/pingcap/kvproto/pkg/import_sstpb"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/tidb/br/pkg/backup"
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend"
-	"github.com/pingcap/tidb/br/pkg/lightning/backend/kv"
+	"github.com/pingcap/tidb/br/pkg/lightning/backend/encode"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend/local"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend/tidb"
 	"github.com/pingcap/tidb/br/pkg/lightning/checkpoints"
 	"github.com/pingcap/tidb/br/pkg/lightning/common"
 	"github.com/pingcap/tidb/br/pkg/lightning/config"
 	"github.com/pingcap/tidb/br/pkg/lightning/errormanager"
-	"github.com/pingcap/tidb/br/pkg/lightning/glue"
 	"github.com/pingcap/tidb/br/pkg/lightning/log"
 	"github.com/pingcap/tidb/br/pkg/lightning/metric"
 	"github.com/pingcap/tidb/br/pkg/lightning/mydump"
 	"github.com/pingcap/tidb/br/pkg/lightning/tikv"
-	verify "github.com/pingcap/tidb/br/pkg/lightning/verification"
 	"github.com/pingcap/tidb/br/pkg/lightning/web"
 	"github.com/pingcap/tidb/br/pkg/lightning/worker"
 	"github.com/pingcap/tidb/br/pkg/pdutil"
@@ -54,34 +52,35 @@ import (
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	tidbconfig "github.com/pingcap/tidb/config"
-	tidbkv "github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/parser/model"
-	"github.com/pingcap/tidb/store/driver"
-	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/collate"
-	"github.com/pingcap/tidb/util/mathutil"
-	regexprrouter "github.com/pingcap/tidb/util/regexpr-router"
-	"github.com/pingcap/tidb/util/set"
+	tidbconfig "github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/keyspace"
+	tidbkv "github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/autoid"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/store/driver"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/etcd"
+	regexprrouter "github.com/pingcap/tidb/pkg/util/regexpr-router"
+	"github.com/pingcap/tidb/pkg/util/set"
+	"github.com/prometheus/client_golang/prometheus"
 	tikvconfig "github.com/tikv/client-go/v2/config"
+	kvutil "github.com/tikv/client-go/v2/util"
 	pd "github.com/tikv/pd/client"
+	pdhttp "github.com/tikv/pd/client/http"
+	"github.com/tikv/pd/client/retry"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
 
+// compact levels
 const (
 	FullLevelCompact = -1
 	Level1Compact    = 1
-)
-
-const (
-	defaultGCLifeTime = 100 * time.Hour
-)
-
-const (
-	indexEngineID = -1
 )
 
 const (
@@ -89,11 +88,12 @@ const (
 	compactStateDoing
 )
 
+// task related table names and create table statements.
 const (
-	TaskMetaTableName  = "task_meta"
+	TaskMetaTableName  = "task_meta_v2"
 	TableMetaTableName = "table_meta"
 	// CreateTableMetadataTable stores the per-table sub jobs information used by TiDB Lightning
-	CreateTableMetadataTable = `CREATE TABLE IF NOT EXISTS %s (
+	CreateTableMetadataTable = `CREATE TABLE IF NOT EXISTS %s.%s (
 		task_id 			BIGINT(20) UNSIGNED,
 		table_id 			BIGINT(64) NOT NULL,
 		table_name 			VARCHAR(64) NOT NULL,
@@ -110,18 +110,17 @@ const (
 		PRIMARY KEY (table_id, task_id)
 	);`
 	// CreateTaskMetaTable stores the pre-lightning metadata used by TiDB Lightning
-	CreateTaskMetaTable = `CREATE TABLE IF NOT EXISTS %s (
+	CreateTaskMetaTable = `CREATE TABLE IF NOT EXISTS %s.%s (
 		task_id BIGINT(20) UNSIGNED NOT NULL,
 		pd_cfgs VARCHAR(2048) NOT NULL DEFAULT '',
 		status  VARCHAR(32) NOT NULL,
 		state   TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0: normal, 1: exited before finish',
-		source_bytes BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
-		cluster_avail BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		tikv_source_bytes BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		tiflash_source_bytes BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		tikv_avail BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		tiflash_avail BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
 		PRIMARY KEY (task_id)
 	);`
-
-	compactionLowerThreshold = 512 * units.MiB
-	compactionUpperThreshold = 32 * units.GiB
 )
 
 var (
@@ -129,13 +128,13 @@ var (
 	maxTiKVVersionForDuplicateResolution = version.NextMajorVersion()
 )
 
-// DeliverPauser is a shared pauser to pause progress to (*chunkRestore).encodeLoop
+// DeliverPauser is a shared pauser to pause progress to (*chunkProcessor).encodeLoop
 var DeliverPauser = common.NewPauser()
 
 // nolint:gochecknoinits // TODO: refactor
 func init() {
 	failpoint.Inject("SetMinDeliverBytes", func(v failpoint.Value) {
-		maxDeliverBytes = uint64(v.(int))
+		minDeliverBytes = uint64(v.(int))
 	})
 }
 
@@ -193,6 +192,7 @@ const (
 	diskQuotaStateImporting
 )
 
+// Controller controls the whole import process.
 type Controller struct {
 	taskCtx       context.Context
 	cfg           *config.Config
@@ -204,14 +204,15 @@ type Controller struct {
 	ioWorkers     *worker.Pool
 	checksumWorks *worker.Pool
 	pauser        *common.Pauser
+	engineMgr     backend.EngineManager
 	backend       backend.Backend
-	tidbGlue      glue.Glue
+	db            *sql.DB
 	pdCli         pd.Client
+	pdHTTPCli     pdhttp.Client
 
-	alterTableLock sync.Mutex
-	sysVars        map[string]string
-	tls            *common.TLS
-	checkTemplate  Template
+	sysVars       map[string]string
+	tls           *common.TLS
+	checkTemplate Template
 
 	errorSummaries errorSummaries
 
@@ -220,11 +221,13 @@ type Controller struct {
 	checkpointsWg sync.WaitGroup
 
 	closedEngineLimit *worker.Pool
-	store             storage.ExternalStorage
-	ownStore          bool
-	metaMgrBuilder    metaMgrBuilder
-	errorMgr          *errormanager.ErrorManager
-	taskMgr           taskMetaMgr
+	addIndexLimit     *worker.Pool
+
+	store          storage.ExternalStorage
+	ownStore       bool
+	metaMgrBuilder metaMgrBuilder
+	errorMgr       *errormanager.ErrorManager
+	taskMgr        taskMetaMgr
 
 	diskQuotaLock  sync.RWMutex
 	diskQuotaState atomic.Int32
@@ -232,8 +235,14 @@ type Controller struct {
 	status         *LightningStatus
 	dupIndicator   *atomic.Bool
 
-	preInfoGetter       PreRestoreInfoGetter
+	preInfoGetter       PreImportInfoGetter
 	precheckItemBuilder *PrecheckItemBuilder
+	encBuilder          encode.EncodingBuilder
+	tikvModeSwitcher    local.TiKVModeSwitcher
+
+	keyspaceName      string
+	resourceGroupName string
+	taskType          string
 }
 
 // LightningStatus provides the finished bytes and total bytes of the current task.
@@ -247,7 +256,6 @@ type LightningStatus struct {
 	backend          string
 	FinishedFileSize atomic.Int64
 	TotalFileSize    atomic.Int64
-	TotalImportSize  atomic.Uint64
 }
 
 // ControllerParam contains many parameters for creating a Controller.
@@ -262,26 +270,34 @@ type ControllerParam struct {
 	OwnExtStorage bool
 	// used by lightning server mode to pause tasks
 	Pauser *common.Pauser
-	// lightning via SQL will implement its glue, to let lightning use host TiDB's environment
-	Glue glue.Glue
+	// DB is a connection pool to TiDB
+	DB *sql.DB
 	// storage interface to write file checkpoints
 	CheckpointStorage storage.ExternalStorage
 	// when CheckpointStorage is not nil, save file checkpoint to it with this name
 	CheckpointName string
 	// DupIndicator can expose the duplicate detection result to the caller
 	DupIndicator *atomic.Bool
+	// Keyspace name
+	KeyspaceName string
+	// ResourceGroup name for current TiDB user
+	ResourceGroupName string
+	// TaskType is the source component name use for background task control.
+	TaskType string
 }
 
-func NewRestoreController(
+// NewImportController creates a new Controller instance.
+func NewImportController(
 	ctx context.Context,
 	cfg *config.Config,
 	param *ControllerParam,
 ) (*Controller, error) {
 	param.Pauser = DeliverPauser
-	return NewRestoreControllerWithPauser(ctx, cfg, param)
+	return NewImportControllerWithPauser(ctx, cfg, param)
 }
 
-func NewRestoreControllerWithPauser(
+// NewImportControllerWithPauser creates a new Controller instance with a pauser.
+func NewImportControllerWithPauser(
 	ctx context.Context,
 	cfg *config.Config,
 	p *ControllerParam,
@@ -299,7 +315,7 @@ func NewRestoreControllerWithPauser(
 			return nil, common.ErrOpenCheckpoint.Wrap(err).GenWithStackByArgs()
 		}
 	} else {
-		cpdb, err = p.Glue.OpenCheckpointsDB(ctx, cfg)
+		cpdb, err = checkpoints.OpenCheckpointsDB(ctx, cfg)
 		if err != nil {
 			if berrors.Is(err, common.ErrUnknownCheckpointDriver) {
 				return nil, err
@@ -320,51 +336,87 @@ func NewRestoreControllerWithPauser(
 		cfg.TaskID = taskCp.TaskID
 	}
 
-	// TODO: support Lightning via SQL
-	db, err := p.Glue.GetDB()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+	db := p.DB
 	errorMgr := errormanager.New(db, cfg, log.FromContext(ctx))
 	if err := errorMgr.Init(ctx); err != nil {
 		return nil, common.ErrInitErrManager.Wrap(err).GenWithStackByArgs()
 	}
 
-	var backend backend.Backend
+	var encodingBuilder encode.EncodingBuilder
+	var backendObj backend.Backend
 	var pdCli pd.Client
+	var pdHTTPCli pdhttp.Client
 	switch cfg.TikvImporter.Backend {
 	case config.BackendTiDB:
-		backend = tidb.NewTiDBBackend(ctx, db, cfg.TikvImporter.OnDuplicate, errorMgr)
+		encodingBuilder = tidb.NewEncodingBuilder()
+		backendObj = tidb.NewTiDBBackend(ctx, db, cfg, errorMgr)
 	case config.BackendLocal:
-		var rLimit local.Rlim_t
+		var rLimit local.RlimT
 		rLimit, err = local.GetSystemRLimit()
 		if err != nil {
 			return nil, err
 		}
-		maxOpenFiles := int(rLimit / local.Rlim_t(cfg.App.TableConcurrency))
+		maxOpenFiles := int(rLimit / local.RlimT(cfg.App.TableConcurrency))
 		// check overflow
 		if maxOpenFiles < 0 {
 			maxOpenFiles = math.MaxInt32
 		}
+
 		addrs := strings.Split(cfg.TiDB.PdAddr, ",")
 		pdCli, err = pd.NewClientWithContext(ctx, addrs, tls.ToPDSecurityOption())
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		pdHTTPCli = pdhttp.NewClientWithServiceDiscovery(
+			"lightning",
+			pdCli.GetServiceDiscovery(),
+			pdhttp.WithTLSConfig(tls.TLSConfig()),
+		).WithBackoffer(retry.InitialBackoffer(time.Second, time.Second, pdutil.PDRequestRetryTime*time.Second))
 
 		if cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone {
-			if err := tikv.CheckTiKVVersion(ctx, tls, pdCli.GetLeaderAddr(), minTiKVVersionForDuplicateResolution, maxTiKVVersionForDuplicateResolution); err != nil {
-				if berrors.Is(err, berrors.ErrVersionMismatch) {
-					log.FromContext(ctx).Warn("TiKV version doesn't support duplicate resolution. The resolution algorithm will fall back to 'none'", zap.Error(err))
-					cfg.TikvImporter.DuplicateResolution = config.DupeResAlgNone
-				} else {
+			if err := tikv.CheckTiKVVersion(ctx, pdHTTPCli, minTiKVVersionForDuplicateResolution, maxTiKVVersionForDuplicateResolution); err != nil {
+				if !berrors.Is(err, berrors.ErrVersionMismatch) {
 					return nil, common.ErrCheckKVVersion.Wrap(err).GenWithStackByArgs()
 				}
+				log.FromContext(ctx).Warn("TiKV version doesn't support duplicate resolution. The resolution algorithm will fall back to 'none'", zap.Error(err))
+				cfg.TikvImporter.DuplicateResolution = config.DupeResAlgNone
 			}
 		}
 
 		initGlobalConfig(tls.ToTiKVSecurityConfig())
-		backend, err = local.NewLocalBackend(ctx, tls, cfg, p.Glue, maxOpenFiles, errorMgr)
+
+		encodingBuilder = local.NewEncodingBuilder(ctx)
+
+		// get resource group name.
+		exec := common.SQLWithRetry{
+			DB:     db,
+			Logger: log.FromContext(ctx),
+		}
+		if err := exec.QueryRow(ctx, "", "select current_resource_group();", &p.ResourceGroupName); err != nil {
+			if common.IsFunctionNotExistErr(err, "current_resource_group") {
+				log.FromContext(ctx).Warn("current_resource_group() not supported, ignore this error", zap.Error(err))
+			}
+		}
+
+		taskType, err := common.GetExplicitRequestSourceTypeFromDB(ctx, db)
+		if err != nil {
+			return nil, errors.Annotatef(err, "get system variable '%s' failed", variable.TiDBExplicitRequestSourceType)
+		}
+		if taskType == "" {
+			taskType = kvutil.ExplicitTypeLightning
+		}
+		p.TaskType = taskType
+
+		isRaftKV2, err := common.IsRaftKV2(ctx, db)
+		if err != nil {
+			log.FromContext(ctx).Warn("check isRaftKV2 failed", zap.Error(err))
+		}
+		var raftKV2SwitchModeDuration time.Duration
+		if isRaftKV2 {
+			raftKV2SwitchModeDuration = cfg.Cron.SwitchMode.Duration
+		}
+		backendConfig := local.NewBackendConfig(cfg, maxOpenFiles, p.KeyspaceName, p.ResourceGroupName, p.TaskType, raftKV2SwitchModeDuration)
+		backendObj, err = local.NewBackend(ctx, tls, backendConfig, pdCli.GetServiceDiscovery())
 		if err != nil {
 			return nil, common.NormalizeOrWrapErr(common.ErrUnknown, err)
 		}
@@ -380,7 +432,7 @@ func NewRestoreControllerWithPauser(
 	var metaBuilder metaMgrBuilder
 	isSSTImport := cfg.TikvImporter.Backend == config.BackendLocal
 	switch {
-	case isSSTImport && cfg.TikvImporter.IncrementalImport:
+	case isSSTImport && cfg.TikvImporter.ParallelImport:
 		metaBuilder = &dbMetaMgrBuilder{
 			db:           db,
 			taskID:       cfg.TaskID,
@@ -394,28 +446,34 @@ func NewRestoreControllerWithPauser(
 	default:
 		metaBuilder = noopMetaMgrBuilder{}
 	}
+
+	var wrapper backend.TargetInfoGetter
+	if cfg.TikvImporter.Backend == config.BackendLocal {
+		wrapper = local.NewTargetInfoGetter(tls, db, pdHTTPCli)
+	} else {
+		wrapper = tidb.NewTargetInfoGetter(db)
+	}
 	ioWorkers := worker.NewPool(ctx, cfg.App.IOConcurrency, "io")
 	targetInfoGetter := &TargetInfoGetterImpl{
-		cfg:          cfg,
-		targetDBGlue: p.Glue,
-		tls:          tls,
-		backend:      backend,
-		pdCli:        pdCli,
+		cfg:       cfg,
+		db:        db,
+		backend:   wrapper,
+		pdHTTPCli: pdHTTPCli,
 	}
-	preInfoGetter, err := NewPreRestoreInfoGetter(
+	preInfoGetter, err := NewPreImportInfoGetter(
 		cfg,
 		p.DBMetas,
 		p.DumpFileStorage,
 		targetInfoGetter,
 		ioWorkers,
-		backend,
+		encodingBuilder,
 	)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	preCheckBuilder := NewPrecheckItemBuilder(
-		cfg, p.DBMetas, preInfoGetter, cpdb, pdCli,
+		cfg, p.DBMetas, preInfoGetter, cpdb, pdHTTPCli,
 	)
 
 	rc := &Controller{
@@ -428,10 +486,12 @@ func NewRestoreControllerWithPauser(
 		ioWorkers:     ioWorkers,
 		checksumWorks: worker.NewPool(ctx, cfg.TiDB.ChecksumTableConcurrency, "checksum"),
 		pauser:        p.Pauser,
-		backend:       backend,
+		engineMgr:     backend.MakeEngineManager(backendObj),
+		backend:       backendObj,
 		pdCli:         pdCli,
-		tidbGlue:      p.Glue,
-		sysVars:       defaultImportantVariables,
+		pdHTTPCli:     pdHTTPCli,
+		db:            db,
+		sysVars:       common.DefaultImportantVariables,
 		tls:           tls,
 		checkTemplate: NewSimpleTemplate(),
 
@@ -439,6 +499,9 @@ func NewRestoreControllerWithPauser(
 		checkpointsDB:     cpdb,
 		saveCpCh:          make(chan saveCp),
 		closedEngineLimit: worker.NewPool(ctx, cfg.App.TableConcurrency*2, "closed-engine"),
+		// Currently, TiDB add index acceration doesn't support multiple tables simultaneously.
+		// So we use a single worker to ensure at most one table is adding index at the same time.
+		addIndexLimit: worker.NewPool(ctx, 1, "add-index"),
 
 		store:          p.DumpFileStorage,
 		ownStore:       p.OwnExtStorage,
@@ -450,19 +513,27 @@ func NewRestoreControllerWithPauser(
 
 		preInfoGetter:       preInfoGetter,
 		precheckItemBuilder: preCheckBuilder,
+		encBuilder:          encodingBuilder,
+		tikvModeSwitcher:    local.NewTiKVModeSwitcher(tls, pdHTTPCli, log.FromContext(ctx).Logger),
+
+		keyspaceName:      p.KeyspaceName,
+		resourceGroupName: p.ResourceGroupName,
+		taskType:          p.TaskType,
 	}
 
 	return rc, nil
 }
 
+// Close closes the controller.
 func (rc *Controller) Close() {
 	rc.backend.Close()
-	rc.tidbGlue.GetSQLExecutor().Close()
+	_ = rc.db.Close()
 	if rc.pdCli != nil {
 		rc.pdCli.Close()
 	}
 }
 
+// Run starts the restore task.
 func (rc *Controller) Run(ctx context.Context) error {
 	failpoint.Inject("beforeRun", func() {})
 
@@ -471,7 +542,7 @@ func (rc *Controller) Run(ctx context.Context) error {
 		rc.restoreSchema,
 		rc.preCheckRequirements,
 		rc.initCheckpoint,
-		rc.restoreTables,
+		rc.importTables,
 		rc.fullCompact,
 		rc.cleanCheckpoints,
 	}
@@ -513,6 +584,7 @@ outside:
 
 type schemaStmtType int
 
+// String implements fmt.Stringer interface.
 func (stmtType schemaStmtType) String() string {
 	switch stmtType {
 	case schemaCreateDatabase:
@@ -545,12 +617,13 @@ type restoreSchemaWorker struct {
 	jobCh  chan *schemaJob
 	errCh  chan error
 	wg     sync.WaitGroup
-	glue   glue.Glue
+	db     *sql.DB
+	parser *parser.Parser
 	store  storage.ExternalStorage
 }
 
 func (worker *restoreSchemaWorker) addJob(sqlStr string, job *schemaJob) error {
-	stmts, err := createIfNotExistsStmt(worker.glue.GetParser(), sqlStr, job.dbName, job.tblName)
+	stmts, err := createIfNotExistsStmt(worker.parser, sqlStr, job.dbName, job.tblName)
 	if err != nil {
 		worker.logger.Warn("failed to rewrite statement, will use raw input instead",
 			zap.String("db", job.dbName),
@@ -676,11 +749,7 @@ loop:
 			if session == nil {
 				session, err = func() (*sql.Conn, error) {
 					// TODO: support lightning in SQL
-					db, err := worker.glue.GetDB()
-					if err != nil {
-						return nil, errors.Trace(err)
-					}
-					return db.Conn(worker.ctx)
+					return worker.db.Conn(worker.ctx)
 				}()
 				if err != nil {
 					worker.wg.Done()
@@ -785,15 +854,18 @@ func (rc *Controller) restoreSchema(ctx context.Context) error {
 	// we can handle the duplicated created with createIfNotExist statement
 	// and we will check the schema in TiDB is valid with the datafile in DataCheck later.
 	logTask := log.FromContext(ctx).Begin(zap.InfoLevel, "restore all schema")
-	concurrency := mathutil.Min(rc.cfg.App.RegionConcurrency, 8)
+	concurrency := min(rc.cfg.App.RegionConcurrency, 8)
 	childCtx, cancel := context.WithCancel(ctx)
+	p := parser.New()
+	p.SetSQLMode(rc.cfg.TiDB.SQLMode)
 	worker := restoreSchemaWorker{
 		ctx:    childCtx,
 		quit:   cancel,
 		logger: log.FromContext(ctx),
 		jobCh:  make(chan *schemaJob, concurrency),
 		errCh:  make(chan error),
-		glue:   rc.tidbGlue,
+		db:     rc.db,
+		parser: p,
 		store:  rc.store,
 	}
 	for i := 0; i < concurrency; i++ {
@@ -840,12 +912,32 @@ func (rc *Controller) initCheckpoint(ctx context.Context) error {
 		log.FromContext(ctx).Warn("exit triggered", zap.String("failpoint", "InitializeCheckpointExit"))
 		os.Exit(0)
 	})
+	if err := rc.loadDesiredTableInfos(ctx); err != nil {
+		return err
+	}
 
 	rc.checkpointsWg.Add(1) // checkpointsWg will be done in `rc.listenCheckpointUpdates`
 	go rc.listenCheckpointUpdates(log.FromContext(ctx))
 
 	// Estimate the number of chunks for progress reporting
 	return rc.estimateChunkCountIntoMetrics(ctx)
+}
+
+func (rc *Controller) loadDesiredTableInfos(ctx context.Context) error {
+	for _, dbInfo := range rc.dbInfos {
+		for _, tableInfo := range dbInfo.Tables {
+			cp, err := rc.checkpointsDB.Get(ctx, common.UniqueTable(dbInfo.Name, tableInfo.Name))
+			if err != nil {
+				return err
+			}
+			// If checkpoint is disabled, cp.TableInfo will be nil.
+			// In this case, we just use current tableInfo as desired tableInfo.
+			if cp.TableInfo != nil {
+				tableInfo.Desired = cp.TableInfo
+			}
+		}
+	}
+	return nil
 }
 
 // verifyCheckpoint check whether previous task checkpoint is compatible with task config
@@ -883,18 +975,6 @@ func verifyCheckpoint(cfg *config.Config, taskCp *checkpoints.TaskCheckpoint) er
 		if cfg.TikvImporter.Backend == config.BackendLocal && cfg.TikvImporter.SortedKVDir != taskCp.SortedKVDir {
 			return common.ErrInvalidCheckpoint.GenWithStack(errorFmt, "mydumper.sorted-kv-dir", cfg.TikvImporter.SortedKVDir, taskCp.SortedKVDir)
 		}
-
-		if cfg.TiDB.Host != taskCp.TiDBHost {
-			return common.ErrInvalidCheckpoint.GenWithStack(errorFmt, "tidb.host", cfg.TiDB.Host, taskCp.TiDBHost)
-		}
-
-		if cfg.TiDB.Port != taskCp.TiDBPort {
-			return common.ErrInvalidCheckpoint.GenWithStack(errorFmt, "tidb.port", cfg.TiDB.Port, taskCp.TiDBPort)
-		}
-
-		if cfg.TiDB.PdAddr != taskCp.PdAddr {
-			return common.ErrInvalidCheckpoint.GenWithStack(errorFmt, "tidb.pd-addr", cfg.TiDB.PdAddr, taskCp.PdAddr)
-		}
 	}
 
 	return nil
@@ -908,7 +988,7 @@ func verifyLocalFile(ctx context.Context, cpdb checkpoints.DB, dir string) error
 	}
 	for tableName, engineIDs := range targetTables {
 		for _, engineID := range engineIDs {
-			_, eID := backend.MakeUUID(tableName, engineID)
+			_, eID := backend.MakeUUID(tableName, int64(engineID))
 			file := local.Engine{UUID: eID}
 			err := file.Exist(dir)
 			if err != nil {
@@ -930,14 +1010,10 @@ func verifyLocalFile(ctx context.Context, cpdb checkpoints.DB, dir string) error
 func (rc *Controller) estimateChunkCountIntoMetrics(ctx context.Context) error {
 	estimatedChunkCount := 0.0
 	estimatedEngineCnt := int64(0)
-	batchSize := rc.cfg.Mydumper.BatchSize
-	if batchSize <= 0 {
-		// if rows in source files are not sorted by primary key(if primary is number or cluster index enabled),
-		// the key range in each data engine may have overlap, thus a bigger engine size can somewhat alleviate it.
-		batchSize = config.DefaultBatchSize
-	}
 	for _, dbMeta := range rc.dbMetas {
 		for _, tableMeta := range dbMeta.Tables {
+			batchSize := mydump.CalculateBatchSize(float64(rc.cfg.Mydumper.BatchSize),
+				tableMeta.IsRowOrdered, float64(tableMeta.TotalSize))
 			tableName := common.UniqueTable(dbMeta.Name, tableMeta.Name)
 			dbCp, err := rc.checkpointsDB.Get(ctx, tableName)
 			if err != nil {
@@ -949,7 +1025,7 @@ func (rc *Controller) estimateChunkCountIntoMetrics(ctx context.Context) error {
 				if eCp.Status < checkpoints.CheckpointStatusImported {
 					estimatedEngineCnt++
 				}
-				if engineID == indexEngineID {
+				if engineID == common.IndexEngineID {
 					continue
 				}
 				for _, c := range eCp.Chunks {
@@ -971,7 +1047,8 @@ func (rc *Controller) estimateChunkCountIntoMetrics(ctx context.Context) error {
 				}
 				if fileMeta.FileMeta.Type == mydump.SourceTypeCSV {
 					cfg := rc.cfg.Mydumper
-					if fileMeta.FileMeta.FileSize > int64(cfg.MaxRegionSize) && cfg.StrictFormat && !cfg.CSV.Header {
+					if fileMeta.FileMeta.FileSize > int64(cfg.MaxRegionSize) && cfg.StrictFormat &&
+						!cfg.CSV.Header && fileMeta.FileMeta.Compression == mydump.CompressionNone {
 						estimatedChunkCount += math.Round(float64(fileMeta.FileMeta.FileSize) / float64(cfg.MaxRegionSize))
 					} else {
 						estimatedChunkCount++
@@ -987,7 +1064,6 @@ func (rc *Controller) estimateChunkCountIntoMetrics(ctx context.Context) error {
 		m.ProcessedEngineCounter.WithLabelValues(metric.ChunkStateEstimated, metric.TableResultSuccess).
 			Add(float64(estimatedEngineCnt))
 	}
-	rc.tidbGlue.Record(glue.RecordEstimatedChunk, uint64(estimatedChunkCount))
 	return nil
 }
 
@@ -1157,19 +1233,14 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 		logProgressChan = logProgressTicker.C
 	}
 
-	glueProgressTicker := time.NewTicker(3 * time.Second)
-	closeFuncs = append(closeFuncs, func() {
-		glueProgressTicker.Stop()
-	})
-
 	var switchModeChan <-chan time.Time
 	// tidb backend don't need to switch tikv to import mode
-	if rc.cfg.TikvImporter.Backend != config.BackendTiDB && rc.cfg.Cron.SwitchMode.Duration > 0 {
+	if isLocalBackend(rc.cfg) && rc.cfg.Cron.SwitchMode.Duration > 0 {
 		switchModeTicker := time.NewTicker(rc.cfg.Cron.SwitchMode.Duration)
 		cancelFuncs = append(cancelFuncs, func(bool) { switchModeTicker.Stop() })
 		cancelFuncs = append(cancelFuncs, func(do bool) {
 			if do {
-				rc.switchToNormalMode(ctx)
+				rc.tikvModeSwitcher.ToNormalMode(ctx)
 			}
 		})
 		switchModeChan = switchModeTicker.C
@@ -1189,8 +1260,8 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 					f()
 				}
 			}()
-			if rc.cfg.Cron.SwitchMode.Duration > 0 {
-				rc.switchToImportMode(ctx)
+			if rc.cfg.Cron.SwitchMode.Duration > 0 && isLocalBackend(rc.cfg) {
+				rc.tikvModeSwitcher.ToImportMode(ctx)
 			}
 			start := time.Now()
 			for {
@@ -1204,7 +1275,8 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 
 				case <-switchModeChan:
 					// periodically switch to import mode, as requested by TiKV 3.0
-					rc.switchToImportMode(ctx)
+					// TiKV will switch back to normal mode if we didn't call this again within 10 minutes
+					rc.tikvModeSwitcher.ToImportMode(ctx)
 
 				case <-logProgressChan:
 					metrics, ok := metric.FromContext(ctx)
@@ -1214,8 +1286,10 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 					}
 					// log the current progress periodically, so OPS will know that we're still working
 					nanoseconds := float64(time.Since(start).Nanoseconds())
-					totalRestoreBytes := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.BytesStateTotalRestore))
-					restoredBytes := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.BytesStateRestored))
+					totalRestoreBytes := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.StateTotalRestore))
+					restoredBytes := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.StateRestored))
+					totalRowsToRestore := metric.ReadAllCounters(metrics.RowsCounter.MetricVec, prometheus.Labels{"state": metric.StateTotalRestore})
+					restoredRows := metric.ReadAllCounters(metrics.RowsCounter.MetricVec, prometheus.Labels{"state": metric.StateRestored})
 					// the estimated chunk is not accurate(likely under estimated), but the actual count is not accurate
 					// before the last table start, so use the bigger of the two should be a workaround
 					estimated := metric.ReadCounter(metrics.ChunkCounter.WithLabelValues(metric.ChunkStateEstimated))
@@ -1233,8 +1307,8 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 						engineEstimated = enginePending
 					}
 					engineFinished := metric.ReadCounter(metrics.ProcessedEngineCounter.WithLabelValues(metric.TableStateImported, metric.TableResultSuccess))
-					bytesWritten := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.BytesStateRestoreWritten))
-					bytesImported := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.BytesStateImported))
+					bytesWritten := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.StateRestoreWritten))
+					bytesImported := metric.ReadCounter(metrics.BytesCounter.WithLabelValues(metric.StateImported))
 
 					var state string
 					var remaining zap.Field
@@ -1265,10 +1339,20 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 					// total progress.
 					restoreBytesField := zap.Skip()
 					importBytesField := zap.Skip()
+					restoreRowsField := zap.Skip()
 					remaining = zap.Skip()
 					totalPercent := 0.0
-					if restoredBytes > 0 {
-						restorePercent := math.Min(restoredBytes/totalRestoreBytes, 1.0)
+					if restoredBytes > 0 || restoredRows > 0 {
+						var restorePercent float64
+						if totalRowsToRestore > 0 {
+							restorePercent = math.Min(restoredRows/totalRowsToRestore, 1.0)
+							restoreRowsField = zap.String("restore-rows", fmt.Sprintf("%.0f/%.0f",
+								restoredRows, totalRowsToRestore))
+						} else {
+							restorePercent = math.Min(restoredBytes/totalRestoreBytes, 1.0)
+							restoreRowsField = zap.String("restore-rows", fmt.Sprintf("%.0f/%.0f(estimated)",
+								restoredRows, restoredRows/restorePercent))
+						}
 						metrics.ProgressGauge.WithLabelValues(metric.ProgressPhaseRestore).Set(restorePercent)
 						if rc.cfg.TikvImporter.Backend != config.BackendTiDB {
 							var importPercent float64
@@ -1318,7 +1402,7 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 						zap.String("tables", fmt.Sprintf("%.0f/%.0f%s", completedTables, totalTables, formatPercent(completedTables, totalTables))),
 						zap.String("chunks", fmt.Sprintf("%.0f/%.0f%s", finished, estimated, formatPercent(finished, estimated))),
 						zap.String("engines", fmt.Sprintf("%.f/%.f%s", engineFinished, engineEstimated, formatPercent(engineFinished, engineEstimated))),
-						restoreBytesField, importBytesField,
+						restoreBytesField, restoreRowsField, importBytesField,
 						encodeSpeedField,
 						zap.String("state", state),
 						remaining,
@@ -1328,12 +1412,6 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 					// verify the total space occupied by sorted-kv-dir is below the quota,
 					// otherwise we perform an emergency import.
 					rc.enforceDiskQuota(ctx)
-
-				case <-glueProgressTicker.C:
-					if m, ok := metric.FromContext(ctx); ok {
-						finished := metric.ReadCounter(m.ChunkCounter.WithLabelValues(metric.ChunkStateFinished))
-						rc.tidbGlue.Record(glue.RecordFinishedChunk, uint64(finished))
-					}
 				}
 			}
 		}, func(do bool) {
@@ -1342,6 +1420,18 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 				f(do)
 			}
 		}
+}
+
+func (rc *Controller) buildTablesRanges() []tidbkv.KeyRange {
+	var keyRanges []tidbkv.KeyRange
+	for _, dbInfo := range rc.dbInfos {
+		for _, tableInfo := range dbInfo.Tables {
+			if ranges, err := backup.BuildTableRanges(tableInfo.Core); err == nil {
+				keyRanges = append(keyRanges, ranges...)
+			}
+		}
+	}
+	return keyRanges
 }
 
 type checksumManagerKeyType struct{}
@@ -1436,9 +1526,9 @@ func (rc *Controller) keepPauseGCForDupeRes(ctx context.Context) (<-chan struct{
 	return exitCh, nil
 }
 
-func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
+func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 	// output error summary
-	defer rc.outpuErrorSummary()
+	defer rc.outputErrorSummary()
 
 	if rc.cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone {
 		subCtx, cancel := context.WithCancel(ctx)
@@ -1476,6 +1566,7 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 	cleanup := false
 	postProgress := func() error { return nil }
 	var kvStore tidbkv.Storage
+	var etcdCli *clientv3.Client
 
 	if isLocalBackend(rc.cfg) {
 		var (
@@ -1483,8 +1574,8 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 			err       error
 		)
 
-		if !rc.taskMgr.CanPauseSchedulerByKeyRange() {
-			logTask.Info("removing PD leader&region schedulers")
+		if rc.cfg.TikvImporter.PausePDSchedulerScope == config.PausePDSchedulerScopeGlobal {
+			logTask.Info("pause pd scheduler of global scope")
 
 			restoreFn, err = rc.taskMgr.CheckAndPausePdSchedulers(ctx)
 			if err != nil {
@@ -1517,27 +1608,49 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 		}
 
 		// Disable GC because TiDB enables GC already.
-
-		currentLeaderAddr := rc.pdCli.GetLeaderAddr()
+		urlsWithScheme := rc.pdCli.GetServiceDiscovery().GetServiceURLs()
 		// remove URL scheme
-		currentLeaderAddr = strings.TrimPrefix(currentLeaderAddr, "http://")
-		currentLeaderAddr = strings.TrimPrefix(currentLeaderAddr, "https://")
+		urlsWithoutScheme := make([]string, 0, len(urlsWithScheme))
+		for _, u := range urlsWithScheme {
+			u = strings.TrimPrefix(u, "http://")
+			u = strings.TrimPrefix(u, "https://")
+			urlsWithoutScheme = append(urlsWithoutScheme, u)
+		}
 		kvStore, err = driver.TiKVDriver{}.OpenWithOptions(
-			fmt.Sprintf("tikv://%s?disableGC=true", currentLeaderAddr),
+			fmt.Sprintf(
+				"tikv://%s?disableGC=true&keyspaceName=%s",
+				strings.Join(urlsWithoutScheme, ","), rc.keyspaceName,
+			),
 			driver.WithSecurity(rc.tls.ToTiKVSecurityConfig()),
 		)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		manager, err := newChecksumManager(ctx, rc, kvStore)
+		etcdCli, err := clientv3.New(clientv3.Config{
+			Endpoints:        urlsWithScheme,
+			AutoSyncInterval: 30 * time.Second,
+			TLS:              rc.tls.TLSConfig(),
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+		etcd.SetEtcdCliByNamespace(etcdCli, keyspace.MakeKeyspaceEtcdNamespace(kvStore.GetCodec()))
+
+		manager, err := NewChecksumManager(ctx, rc, kvStore)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		ctx = context.WithValue(ctx, &checksumManagerKey, manager)
+
+		undo, err := rc.registerTaskToPD(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer undo()
 	}
 
 	type task struct {
-		tr *TableRestore
+		tr *TableImporter
 		cp *checkpoints.TableCheckpoint
 	}
 
@@ -1583,6 +1696,11 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 				logTask.Warn("failed to close kv store", zap.Error(err))
 			}
 		}
+		if etcdCli != nil {
+			if err := etcdCli.Close(); err != nil {
+				logTask.Warn("failed to close etcd client", zap.Error(err))
+			}
+		}
 	}()
 
 	taskCh := make(chan task, rc.cfg.App.IndexConcurrency)
@@ -1594,7 +1712,7 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 				tableLogTask := task.tr.logger.Begin(zap.InfoLevel, "restore table")
 				web.BroadcastTableCheckpoint(task.tr.tableName, task.cp)
 
-				needPostProcess, err := task.tr.restoreTable(ctx, rc, task.cp)
+				needPostProcess, err := task.tr.importTable(ctx, rc, task.cp)
 				if err != nil && !common.IsContextCanceledError(err) {
 					task.tr.logger.Error("failed to import table", zap.Error(err))
 				}
@@ -1632,7 +1750,7 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			tr, err := NewTableRestore(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), kvStore, log.FromContext(ctx))
+			tr, err := NewTableImporter(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), kvStore, etcdCli, log.FromContext(ctx))
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -1640,13 +1758,33 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 			allTasks = append(allTasks, task{tr: tr, cp: cp})
 
 			if len(cp.Engines) == 0 {
-				for _, fi := range tableMeta.DataFiles {
+				for i, fi := range tableMeta.DataFiles {
 					totalDataSizeToRestore += fi.FileMeta.FileSize
+					if fi.FileMeta.Type == mydump.SourceTypeParquet {
+						numberRows, err := mydump.ReadParquetFileRowCountByFile(ctx, rc.store, fi.FileMeta)
+						if err != nil {
+							return errors.Trace(err)
+						}
+						if m, ok := metric.FromContext(ctx); ok {
+							m.RowsCounter.WithLabelValues(metric.StateTotalRestore, tableName).Add(float64(numberRows))
+						}
+						fi.FileMeta.Rows = numberRows
+						tableMeta.DataFiles[i] = fi
+					}
 				}
 			} else {
 				for _, eng := range cp.Engines {
 					for _, chunk := range eng.Chunks {
-						totalDataSizeToRestore += chunk.UnfinishedSize()
+						// for parquet files filesize is more accurate, we can calculate correct unfinished bytes unless
+						//  we set up the reader, so we directly use filesize here
+						if chunk.FileMeta.Type == mydump.SourceTypeParquet {
+							totalDataSizeToRestore += chunk.FileMeta.FileSize
+							if m, ok := metric.FromContext(ctx); ok {
+								m.RowsCounter.WithLabelValues(metric.StateTotalRestore, tableName).Add(float64(chunk.UnfinishedSize()))
+							}
+						} else {
+							totalDataSizeToRestore += chunk.UnfinishedSize()
+						}
 					}
 				}
 			}
@@ -1654,7 +1792,7 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 	}
 
 	if m, ok := metric.FromContext(ctx); ok {
-		m.BytesCounter.WithLabelValues(metric.BytesStateTotalRestore).Add(float64(totalDataSizeToRestore))
+		m.BytesCounter.WithLabelValues(metric.StateTotalRestore).Add(float64(totalDataSizeToRestore))
 	}
 
 	for i := range allTasks {
@@ -1695,11 +1833,36 @@ func (rc *Controller) restoreTables(ctx context.Context) (finalErr error) {
 			}()
 		}
 		wg.Wait()
-		logTask.Warn("total import size", zap.Uint64("total import size", rc.status.TotalImportSize.Load()))
 		return restoreErr.Get()
 	}
 
 	return nil
+}
+
+func (rc *Controller) registerTaskToPD(ctx context.Context) (undo func(), _ error) {
+	etcdCli, err := dialEtcdWithCfg(ctx, rc.cfg, rc.pdCli.GetServiceDiscovery().GetServiceURLs())
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	register := utils.NewTaskRegister(etcdCli, utils.RegisterLightning, fmt.Sprintf("lightning-%s", uuid.New()))
+
+	undo = func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := register.Close(closeCtx); err != nil {
+			log.L().Warn("failed to unregister task", zap.Error(err))
+		}
+		if err := etcdCli.Close(); err != nil {
+			log.L().Warn("failed to close etcd client", zap.Error(err))
+		}
+	}
+	if err := register.RegisterTask(ctx); err != nil {
+		undo()
+		return nil, errors.Trace(err)
+	}
+	return undo, nil
 }
 
 func addExtendDataForCheckpoint(
@@ -1749,116 +1912,7 @@ func addExtendDataForCheckpoint(
 	return nil
 }
 
-func (tr *TableRestore) restoreTable(
-	ctx context.Context,
-	rc *Controller,
-	cp *checkpoints.TableCheckpoint,
-) (bool, error) {
-	// 1. Load the table info.
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	default:
-	}
-
-	metaMgr := rc.metaMgrBuilder.TableMetaMgr(tr)
-	// no need to do anything if the chunks are already populated
-	if len(cp.Engines) > 0 {
-		tr.logger.Info("reusing engines and files info from checkpoint",
-			zap.Int("enginesCnt", len(cp.Engines)),
-			zap.Int("filesCnt", cp.CountChunks()),
-		)
-		err := addExtendDataForCheckpoint(ctx, rc.cfg, cp)
-		if err != nil {
-			return false, errors.Trace(err)
-		}
-	} else if cp.Status < checkpoints.CheckpointStatusAllWritten {
-		if err := tr.populateChunks(ctx, rc, cp); err != nil {
-			return false, errors.Trace(err)
-		}
-
-		// fetch the max chunk row_id max value as the global max row_id
-		rowIDMax := int64(0)
-		for _, engine := range cp.Engines {
-			if len(engine.Chunks) > 0 && engine.Chunks[len(engine.Chunks)-1].Chunk.RowIDMax > rowIDMax {
-				rowIDMax = engine.Chunks[len(engine.Chunks)-1].Chunk.RowIDMax
-			}
-		}
-		db, _ := rc.tidbGlue.GetDB()
-		versionStr, err := version.FetchVersion(ctx, db)
-		if err != nil {
-			return false, errors.Trace(err)
-		}
-
-		versionInfo := version.ParseServerInfo(versionStr)
-
-		// "show table next_row_id" is only available after tidb v4.0.0
-		if versionInfo.ServerVersion.Major >= 4 && isLocalBackend(rc.cfg) {
-			// first, insert a new-line into meta table
-			if err = metaMgr.InitTableMeta(ctx); err != nil {
-				return false, err
-			}
-
-			checksum, rowIDBase, err := metaMgr.AllocTableRowIDs(ctx, rowIDMax)
-			if err != nil {
-				return false, err
-			}
-			tr.RebaseChunkRowIDs(cp, rowIDBase)
-
-			if checksum != nil {
-				if cp.Checksum != *checksum {
-					cp.Checksum = *checksum
-					rc.saveCpCh <- saveCp{
-						tableName: tr.tableName,
-						merger: &checkpoints.TableChecksumMerger{
-							Checksum: cp.Checksum,
-						},
-					}
-				}
-				tr.logger.Info("checksum before restore table", zap.Object("checksum", &cp.Checksum))
-			}
-		}
-		if err := rc.checkpointsDB.InsertEngineCheckpoints(ctx, tr.tableName, cp.Engines); err != nil {
-			return false, errors.Trace(err)
-		}
-		web.BroadcastTableCheckpoint(tr.tableName, cp)
-
-		// rebase the allocator so it exceeds the number of rows.
-		if tr.tableInfo.Core.ContainsAutoRandomBits() {
-			cp.AllocBase = mathutil.Max(cp.AllocBase, tr.tableInfo.Core.AutoRandID)
-			if err := tr.alloc.Get(autoid.AutoRandomType).Rebase(context.Background(), cp.AllocBase, false); err != nil {
-				return false, err
-			}
-		} else {
-			cp.AllocBase = mathutil.Max(cp.AllocBase, tr.tableInfo.Core.AutoIncID)
-			if err := tr.alloc.Get(autoid.RowIDAllocType).Rebase(context.Background(), cp.AllocBase, false); err != nil {
-				return false, err
-			}
-		}
-		rc.saveCpCh <- saveCp{
-			tableName: tr.tableName,
-			merger: &checkpoints.RebaseCheckpointMerger{
-				AllocBase: cp.AllocBase,
-			},
-		}
-	}
-
-	// 2. Restore engines (if still needed)
-	err := tr.restoreEngines(ctx, rc, cp)
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-
-	err = metaMgr.UpdateTableStatus(ctx, metaStatusRestoreFinished)
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-
-	// 3. Post-process. With the last parameter set to false, we can allow delay analyze execute latter
-	return tr.postProcess(ctx, rc, cp, false /* force-analyze */, metaMgr)
-}
-
-func (rc *Controller) outpuErrorSummary() {
+func (rc *Controller) outputErrorSummary() {
 	if rc.errorMgr.HasError() {
 		fmt.Println(rc.errorMgr.Output())
 	}
@@ -1882,52 +1936,12 @@ func (rc *Controller) fullCompact(ctx context.Context) error {
 }
 
 func (rc *Controller) doCompact(ctx context.Context, level int32) error {
-	tls := rc.tls.WithHost(rc.pdCli.GetLeaderAddr())
 	return tikv.ForAllStores(
 		ctx,
-		tls,
-		tikv.StoreStateDisconnected,
-		func(c context.Context, store *tikv.Store) error {
-			return tikv.Compact(c, tls, store.Address, level)
-		},
-	)
-}
-
-func (rc *Controller) switchToImportMode(ctx context.Context) {
-	rc.switchTiKVMode(ctx, sstpb.SwitchMode_Import)
-}
-
-func (rc *Controller) switchToNormalMode(ctx context.Context) {
-	rc.switchTiKVMode(ctx, sstpb.SwitchMode_Normal)
-}
-
-func (rc *Controller) switchTiKVMode(ctx context.Context, mode sstpb.SwitchMode) {
-	// // tidb backend don't need to switch tikv to import mode
-	if isTiDBBackend(rc.cfg) {
-		return
-	}
-
-	log.FromContext(ctx).Info("switch import mode", zap.Stringer("mode", mode))
-
-	// It is fine if we miss some stores which did not switch to Import mode,
-	// since we're running it periodically, so we exclude disconnected stores.
-	// But it is essential all stores be switched back to Normal mode to allow
-	// normal operation.
-	var minState tikv.StoreState
-	if mode == sstpb.SwitchMode_Import {
-		minState = tikv.StoreStateOffline
-	} else {
-		minState = tikv.StoreStateDisconnected
-	}
-	tls := rc.tls.WithHost(rc.cfg.TiDB.PdAddr)
-	// we ignore switch mode failure since it is not fatal.
-	// no need log the error, it is done in kv.SwitchMode already.
-	_ = tikv.ForAllStores(
-		ctx,
-		tls,
-		minState,
-		func(c context.Context, store *tikv.Store) error {
-			return tikv.SwitchMode(c, tls, store.Address, mode)
+		rc.pdHTTPCli,
+		metapb.StoreState_Offline,
+		func(c context.Context, store *pdhttp.MetaStore) error {
+			return tikv.Compact(c, rc.tls, store.Address, level, rc.resourceGroupName)
 		},
 	)
 }
@@ -1939,6 +1953,7 @@ func (rc *Controller) enforceDiskQuota(ctx context.Context) {
 		return
 	}
 
+	localBackend := rc.backend.(*local.Backend)
 	go func() {
 		// locker is assigned when we detect the disk quota is exceeded.
 		// before the disk quota is confirmed exceeded, we keep the diskQuotaLock
@@ -1966,7 +1981,7 @@ func (rc *Controller) enforceDiskQuota(ctx context.Context) {
 			}
 
 			quota := int64(rc.cfg.TikvImporter.DiskQuota)
-			largeEngines, inProgressLargeEngines, totalDiskSize, totalMemSize := rc.backend.CheckDiskQuota(quota)
+			largeEngines, inProgressLargeEngines, totalDiskSize, totalMemSize := local.CheckDiskQuota(localBackend, quota)
 			if m, ok := metric.FromContext(ctx); ok {
 				m.LocalStorageUsageBytesGauge.WithLabelValues("disk").Set(float64(totalDiskSize))
 				m.LocalStorageUsageBytesGauge.WithLabelValues("mem").Set(float64(totalMemSize))
@@ -1997,7 +2012,7 @@ func (rc *Controller) enforceDiskQuota(ctx context.Context) {
 			}
 
 			// flush all engines so that checkpoints can be updated.
-			if err := rc.backend.FlushAll(ctx); err != nil {
+			if err := rc.backend.FlushAllEngines(ctx); err != nil {
 				logger.Error("flush engine for disk quota failed, check again later", log.ShortError(err))
 				return
 			}
@@ -2010,7 +2025,7 @@ func (rc *Controller) enforceDiskQuota(ctx context.Context) {
 			var importErr error
 			for _, engine := range largeEngines {
 				// Use a larger split region size to avoid split the same region by many times.
-				if err := rc.backend.UnsafeImportAndReset(ctx, engine, int64(config.SplitRegionSize)*int64(config.MaxSplitRegionSizeRatio), int64(config.SplitRegionKeys)*int64(config.MaxSplitRegionSizeRatio), int64(config.MinRegionNum)); err != nil {
+				if err := localBackend.UnsafeImportAndReset(ctx, engine, int64(config.SplitRegionSize)*int64(config.MaxSplitRegionSizeRatio), int64(config.SplitRegionKeys)*int64(config.MaxSplitRegionSizeRatio), int64(config.MinRegionNum)); err != nil {
 					importErr = multierr.Append(importErr, err)
 				}
 			}
@@ -2026,14 +2041,14 @@ func (rc *Controller) setGlobalVariables(ctx context.Context) error {
 		return nil
 	}
 	// set new collation flag base on tidb config
-	enabled, err := ObtainNewCollationEnabled(ctx, rc.tidbGlue.GetSQLExecutor())
+	enabled, err := ObtainNewCollationEnabled(ctx, rc.db)
 	if err != nil {
 		return err
 	}
 	// we should enable/disable new collation here since in server mode, tidb config
 	// may be different in different tasks
 	collate.SetNewCollationEnabledForTest(enabled)
-	log.FromContext(ctx).Info("new_collation_enabled", zap.Bool("enabled", enabled))
+	log.FromContext(ctx).Info(utils.TidbNewCollationEnabled, zap.Bool("enabled", enabled))
 
 	return nil
 }
@@ -2114,6 +2129,7 @@ func (rc *Controller) preCheckRequirements(ctx context.Context) error {
 		return common.ErrCheckDataSource.Wrap(err).GenWithStackByArgs()
 	}
 	estimatedDataSizeWithIndex := estimatedSizeResult.SizeWithIndex
+	estimatedTiflashDataSize := estimatedSizeResult.TiFlashSize
 
 	// Do not import with too large concurrency because these data may be all unsorted.
 	if estimatedSizeResult.HasUnsortedBigTables {
@@ -2125,6 +2141,7 @@ func (rc *Controller) preCheckRequirements(ctx context.Context) error {
 		rc.status.TotalFileSize.Store(estimatedSizeResult.SizeWithoutIndex)
 	}
 	if isLocalBackend(rc.cfg) {
+		// TODO(lance6716): use rc.pdCli to create pd controller
 		pdController, err := pdutil.NewPdController(ctx, rc.pdCli.GetLeaderAddr(),
 			rc.tls.TLSConfig(), rc.tls.ToPDSecurityOption())
 		if err != nil {
@@ -2138,9 +2155,13 @@ func (rc *Controller) preCheckRequirements(ctx context.Context) error {
 			return common.ErrMetaMgrUnknown.Wrap(err).GenWithStackByArgs()
 		}
 		if !taskExist {
-			if err = rc.taskMgr.InitTask(ctx, estimatedDataSizeWithIndex); err != nil {
+			if err = rc.taskMgr.InitTask(ctx, estimatedDataSizeWithIndex, estimatedTiflashDataSize); err != nil {
 				return common.ErrMetaMgrUnknown.Wrap(err).GenWithStackByArgs()
 			}
+		}
+		if rc.cfg.TikvImporter.PausePDSchedulerScope == config.PausePDSchedulerScopeTable &&
+			!rc.taskMgr.CanPauseSchedulerByKeyRange() {
+			return errors.New("target cluster don't support pause-pd-scheduler-scope=table, the minimal version required is 6.1.0")
 		}
 		if rc.cfg.App.CheckRequirements {
 			needCheck := true
@@ -2175,7 +2196,7 @@ func (rc *Controller) preCheckRequirements(ctx context.Context) error {
 		}
 	}
 
-	if rc.tidbGlue.OwnsSQLExecutor() && rc.cfg.App.CheckRequirements {
+	if rc.cfg.App.CheckRequirements {
 		fmt.Println(rc.checkTemplate.Output())
 	}
 	if !rc.checkTemplate.Success() {
@@ -2218,118 +2239,13 @@ func (rc *Controller) DataCheck(ctx context.Context) error {
 	return nil
 }
 
-type chunkRestore struct {
-	parser mydump.Parser
-	index  int
-	chunk  *checkpoints.ChunkCheckpoint
-}
-
-func newChunkRestore(
-	ctx context.Context,
-	index int,
-	cfg *config.Config,
-	chunk *checkpoints.ChunkCheckpoint,
-	ioWorkers *worker.Pool,
-	store storage.ExternalStorage,
-	tableInfo *checkpoints.TidbTableInfo,
-) (*chunkRestore, error) {
-	blockBufSize := int64(cfg.Mydumper.ReadBlockSize)
-	if cfg.App.MaxDeliverBytes > 0 {
-		maxDeliverBytes = cfg.App.MaxDeliverBytes
-	}
-	if cfg.App.MaxDeliverRows > 0 {
-		maxDeliverRows = cfg.App.MaxDeliverRows
-	}
-	reader, err := openReader(ctx, chunk.FileMeta, store)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	var parser mydump.Parser
-	switch chunk.FileMeta.Type {
-	case mydump.SourceTypeCSV:
-		hasHeader := cfg.Mydumper.CSV.Header && chunk.Chunk.Offset == 0
-		// Create a utf8mb4 convertor to encode and decode data with the charset of CSV files.
-		charsetConvertor, err := mydump.NewCharsetConvertor(cfg.Mydumper.DataCharacterSet, cfg.Mydumper.DataInvalidCharReplace)
-		if err != nil {
-			return nil, err
-		}
-		parser, err = mydump.NewCSVParser(ctx, &cfg.Mydumper.CSV, reader, blockBufSize, ioWorkers, hasHeader, charsetConvertor)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	case mydump.SourceTypeSQL:
-		parser = mydump.NewChunkParser(ctx, cfg.TiDB.SQLMode, reader, blockBufSize, ioWorkers)
-	case mydump.SourceTypeParquet:
-		parser, err = mydump.NewParquetParser(ctx, store, reader, chunk.FileMeta.Path)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	default:
-		panic(fmt.Sprintf("file '%s' with unknown source type '%s'", chunk.Key.Path, chunk.FileMeta.Type.String()))
-	}
-
-	if chunk.FileMeta.Compression == mydump.CompressionNone {
-		if err = parser.SetPos(chunk.Chunk.Offset, chunk.Chunk.PrevRowIDMax); err != nil {
-			return nil, errors.Trace(err)
-		}
-	} else {
-		if err = mydump.ReadUntil(parser, chunk.Chunk.Offset); err != nil {
-			return nil, errors.Trace(err)
-		}
-		parser.SetRowID(chunk.Chunk.PrevRowIDMax)
-	}
-	if len(chunk.ColumnPermutation) > 0 {
-		parser.SetColumns(getColumnNames(tableInfo.Core, chunk.ColumnPermutation))
-	}
-
-	return &chunkRestore{
-		parser: parser,
-		index:  index,
-		chunk:  chunk,
-	}, nil
-}
-
-func (cr *chunkRestore) close() {
-	_ = cr.parser.Close()
-}
-
-func getColumnNames(tableInfo *model.TableInfo, permutation []int) []string {
-	colIndexes := make([]int, 0, len(permutation))
-	for i := 0; i < len(permutation); i++ {
-		colIndexes = append(colIndexes, -1)
-	}
-	colCnt := 0
-	for i, p := range permutation {
-		if p >= 0 {
-			colIndexes[p] = i
-			colCnt++
-		}
-	}
-
-	names := make([]string, 0, colCnt)
-	for _, idx := range colIndexes {
-		// skip columns with index -1
-		if idx >= 0 {
-			// original fields contains _tidb_rowid field
-			if idx == len(tableInfo.Columns) {
-				names = append(names, model.ExtraHandleName.O)
-			} else {
-				names = append(names, tableInfo.Columns[idx].Name.O)
-			}
-		}
-	}
-	return names
-}
-
 var (
 	maxKVQueueSize         = 32             // Cache at most this number of rows before blocking the encode loop
-	maxDeliverBytes uint64 = 96 * units.KiB // 96 KB (data + index). send at most this amount of bytes at a time
-	maxDeliverRows  uint64 = 5000           // send at most this amount of rows at a time
+	minDeliverBytes uint64 = 96 * units.KiB // 96 KB (data + index). batch at least this amount of bytes to reduce number of messages
 )
 
 type deliveredKVs struct {
-	kvs     kv.Row // if kvs is nil, this indicated we've got the last message.
+	kvs     encode.Row // if kvs is nil, this indicated we've got the last message.
 	columns []string
 	offset  int64
 	rowID   int64
@@ -2342,196 +2258,7 @@ type deliverResult struct {
 	err      error
 }
 
-//nolint:nakedret // TODO: refactor
-func (cr *chunkRestore) deliverLoop(
-	ctx context.Context,
-	kvsCh <-chan []deliveredKVs,
-	t *TableRestore,
-	engineID int32,
-	dataEngine, indexEngine *backend.LocalEngineWriter,
-	rc *Controller,
-) (deliverTotalDur time.Duration, err error) {
-	deliverLogger := t.logger.With(
-		zap.Int32("engineNumber", engineID),
-		zap.Int("fileIndex", cr.index),
-		zap.Stringer("path", &cr.chunk.Key),
-		zap.String("task", "deliver"),
-	)
-	// Fetch enough KV pairs from the source.
-	dataKVs := rc.backend.MakeEmptyRows()
-	indexKVs := rc.backend.MakeEmptyRows()
-
-	dataSynced := true
-	hasMoreKVs := true
-	var startRealOffset, currRealOffset int64 // save to 0 at first
-
-	for hasMoreKVs {
-		var dataChecksum, indexChecksum verify.KVChecksum
-		var columns []string
-		var kvPacket []deliveredKVs
-		// init these two field as checkpoint current value, so even if there are no kv pairs delivered,
-		// chunk checkpoint should stay the same
-		startOffset := cr.chunk.Chunk.Offset
-		currOffset := startOffset
-		startRealOffset = cr.chunk.Chunk.RealOffset
-		currRealOffset = startRealOffset
-		rowID := cr.chunk.Chunk.PrevRowIDMax
-
-	populate:
-		for dataChecksum.SumSize()+indexChecksum.SumSize() < maxDeliverBytes && dataChecksum.SumKVS()+indexChecksum.SumKVS() < maxDeliverRows {
-			select {
-			case kvPacket = <-kvsCh:
-				if len(kvPacket) == 0 {
-					hasMoreKVs = false
-					break populate
-				}
-				for _, p := range kvPacket {
-					if p.kvs == nil {
-						// This is the last message.
-						currOffset = p.offset
-						currRealOffset = p.realOffset
-						hasMoreKVs = false
-						break populate
-					}
-					p.kvs.ClassifyAndAppend(&dataKVs, &dataChecksum, &indexKVs, &indexChecksum)
-					columns = p.columns
-					currOffset = p.offset
-					currRealOffset = p.realOffset
-					rowID = p.rowID
-				}
-			case <-ctx.Done():
-				err = ctx.Err()
-				return
-			}
-		}
-
-		err = func() error {
-			// We use `TryRLock` with sleep here to avoid blocking current goroutine during importing when disk-quota is
-			// triggered, so that we can save chunkCheckpoint as soon as possible after `FlushEngine` is called.
-			// This implementation may not be very elegant or even completely correct, but it is currently a relatively
-			// simple and effective solution.
-			for !rc.diskQuotaLock.TryRLock() {
-				// try to update chunk checkpoint, this can help save checkpoint after importing when disk-quota is triggered
-				if !dataSynced {
-					dataSynced = cr.maybeSaveCheckpoint(rc, t, engineID, cr.chunk, dataEngine, indexEngine)
-				}
-				time.Sleep(time.Millisecond)
-			}
-			defer rc.diskQuotaLock.RUnlock()
-
-			// Write KVs into the engine
-			start := time.Now()
-
-			if err = dataEngine.WriteRows(ctx, columns, dataKVs); err != nil {
-				if !common.IsContextCanceledError(err) {
-					deliverLogger.Error("write to data engine failed", log.ShortError(err))
-				}
-
-				return errors.Trace(err)
-			}
-			if err = indexEngine.WriteRows(ctx, columns, indexKVs); err != nil {
-				if !common.IsContextCanceledError(err) {
-					deliverLogger.Error("write to index engine failed", log.ShortError(err))
-				}
-				return errors.Trace(err)
-			}
-
-			if m, ok := metric.FromContext(ctx); ok {
-				deliverDur := time.Since(start)
-				deliverTotalDur += deliverDur
-				m.BlockDeliverSecondsHistogram.Observe(deliverDur.Seconds())
-				m.BlockDeliverBytesHistogram.WithLabelValues(metric.BlockDeliverKindData).Observe(float64(dataChecksum.SumSize()))
-				m.BlockDeliverBytesHistogram.WithLabelValues(metric.BlockDeliverKindIndex).Observe(float64(indexChecksum.SumSize()))
-				m.BlockDeliverKVPairsHistogram.WithLabelValues(metric.BlockDeliverKindData).Observe(float64(dataChecksum.SumKVS()))
-				m.BlockDeliverKVPairsHistogram.WithLabelValues(metric.BlockDeliverKindIndex).Observe(float64(indexChecksum.SumKVS()))
-			}
-			return nil
-		}()
-		if err != nil {
-			return
-		}
-		dataSynced = false
-
-		dataKVs = dataKVs.Clear()
-		indexKVs = indexKVs.Clear()
-
-		// Update the table, and save a checkpoint.
-		// (the write to the importer is effective immediately, thus update these here)
-		// No need to apply a lock since this is the only thread updating `cr.chunk.**`.
-		// In local mode, we should write these checkpoints after engine flushed.
-		lastOffset := cr.chunk.Chunk.Offset
-		cr.chunk.Checksum.Add(&dataChecksum)
-		cr.chunk.Checksum.Add(&indexChecksum)
-		cr.chunk.Chunk.Offset = currOffset
-		cr.chunk.Chunk.RealOffset = currRealOffset
-		cr.chunk.Chunk.PrevRowIDMax = rowID
-
-		if m, ok := metric.FromContext(ctx); ok {
-			// value of currOffset comes from parser.pos which increase monotonically. the init value of parser.pos
-			// comes from chunk.Chunk.Offset. so it shouldn't happen that currOffset - startOffset < 0.
-			// but we met it one time, but cannot reproduce it now, we add this check to make code more robust
-			// TODO: reproduce and find the root cause and fix it completely
-			var lowOffset, highOffset int64
-			if cr.chunk.FileMeta.Compression != mydump.CompressionNone {
-				lowOffset, highOffset = startRealOffset, currRealOffset
-			} else {
-				lowOffset, highOffset = startOffset, currOffset
-			}
-			delta := highOffset - lowOffset
-			if delta >= 0 {
-				m.BytesCounter.WithLabelValues(metric.BytesStateRestored).Add(float64(delta))
-				if rc.status != nil && rc.status.backend == config.BackendTiDB {
-					rc.status.FinishedFileSize.Add(delta)
-				}
-			} else {
-				deliverLogger.Warn("offset go back", zap.Int64("curr", highOffset),
-					zap.Int64("start", lowOffset))
-			}
-		}
-
-		if currOffset > lastOffset || dataChecksum.SumKVS() != 0 || indexChecksum.SumKVS() != 0 {
-			// No need to save checkpoint if nothing was delivered.
-			dataSynced = cr.maybeSaveCheckpoint(rc, t, engineID, cr.chunk, dataEngine, indexEngine)
-		}
-		failpoint.Inject("SlowDownWriteRows", func() {
-			deliverLogger.Warn("Slowed down write rows")
-			finished := rc.status.FinishedFileSize.Load()
-			total := rc.status.TotalFileSize.Load()
-			deliverLogger.Warn("PrintStatus Failpoint",
-				zap.Int64("finished", finished),
-				zap.Int64("total", total))
-		})
-		failpoint.Inject("FailAfterWriteRows", nil)
-		// TODO: for local backend, we may save checkpoint more frequently, e.g. after written
-		// 10GB kv pairs to data engine, we can do a flush for both data & index engine, then we
-		// can safely update current checkpoint.
-
-		failpoint.Inject("LocalBackendSaveCheckpoint", func() {
-			if !isLocalBackend(rc.cfg) && (dataChecksum.SumKVS() != 0 || indexChecksum.SumKVS() != 0) {
-				// No need to save checkpoint if nothing was delivered.
-				saveCheckpoint(rc, t, engineID, cr.chunk)
-			}
-		})
-	}
-
-	return
-}
-
-func (cr *chunkRestore) maybeSaveCheckpoint(
-	rc *Controller,
-	t *TableRestore,
-	engineID int32,
-	chunk *checkpoints.ChunkCheckpoint,
-	data, index *backend.LocalEngineWriter,
-) bool {
-	if data.IsSynced() && index.IsSynced() {
-		saveCheckpoint(rc, t, engineID, chunk)
-		return true
-	}
-	return false
-}
-
-func saveCheckpoint(rc *Controller, t *TableRestore, engineID int32, chunk *checkpoints.ChunkCheckpoint) {
+func saveCheckpoint(rc *Controller, t *TableImporter, engineID int32, chunk *checkpoints.ChunkCheckpoint) {
 	// We need to update the AllocBase every time we've finished a file.
 	// The AllocBase is determined by the maximum of the "handle" (_tidb_rowid
 	// or integer primary key), which can only be obtained by reading all data.
@@ -2606,256 +2333,6 @@ func filterColumns(columnNames []string, extendData mydump.ExtendColumnData, ign
 		extendValueDatums = append(extendValueDatums, types.NewStringDatum(extendVal))
 	}
 	return filteredColumns, extendValueDatums
-}
-
-//nolint:nakedret // TODO: refactor
-func (cr *chunkRestore) encodeLoop(
-	ctx context.Context,
-	kvsCh chan<- []deliveredKVs,
-	t *TableRestore,
-	logger log.Logger,
-	kvEncoder kv.Encoder,
-	deliverCompleteCh <-chan deliverResult,
-	rc *Controller,
-) (readTotalDur time.Duration, encodeTotalDur time.Duration, err error) {
-	defer close(kvsCh)
-
-	send := func(kvs []deliveredKVs) error {
-		select {
-		case kvsCh <- kvs:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		case deliverResult, ok := <-deliverCompleteCh:
-			if deliverResult.err == nil && !ok {
-				deliverResult.err = ctx.Err()
-			}
-			if deliverResult.err == nil {
-				deliverResult.err = errors.New("unexpected premature fulfillment")
-				logger.DPanic("unexpected: deliverCompleteCh prematurely fulfilled with no error", zap.Bool("chIsOpen", ok))
-			}
-			return errors.Trace(deliverResult.err)
-		}
-	}
-
-	pauser, maxKvPairsCnt := rc.pauser, rc.cfg.TikvImporter.MaxKVPairs
-	initializedColumns, reachEOF := false, false
-	// filteredColumns is column names that excluded ignored columns
-	// WARN: this might be not correct when different SQL statements contains different fields,
-	// but since ColumnPermutation also depends on the hypothesis that the columns in one source file is the same
-	// so this should be ok.
-	var (
-		filteredColumns []string
-		extendVals      []types.Datum
-	)
-	ignoreColumns, err1 := rc.cfg.Mydumper.IgnoreColumns.GetIgnoreColumns(t.dbInfo.Name, t.tableInfo.Core.Name.O, rc.cfg.Mydumper.CaseSensitive)
-	if err1 != nil {
-		err = err1
-		return
-	}
-	for !reachEOF {
-		if err = pauser.Wait(ctx); err != nil {
-			return
-		}
-		offset, _ := cr.parser.Pos()
-		if offset >= cr.chunk.Chunk.EndOffset {
-			break
-		}
-
-		var readDur, encodeDur time.Duration
-		canDeliver := false
-		kvPacket := make([]deliveredKVs, 0, maxKvPairsCnt)
-		curOffset := offset
-		var newOffset, rowID, realOffset int64
-		var kvSize uint64
-		var realOffsetErr error
-	outLoop:
-		for !canDeliver {
-			readDurStart := time.Now()
-			err = cr.parser.ReadRow()
-			columnNames := cr.parser.Columns()
-			newOffset, rowID = cr.parser.Pos()
-			if cr.chunk.FileMeta.Compression != mydump.CompressionNone {
-				realOffset, realOffsetErr = cr.parser.RealPos()
-				if realOffsetErr != nil {
-					logger.Warn("fail to get data engine RealPos, progress may not be accurate",
-						log.ShortError(realOffsetErr), zap.String("file", cr.chunk.FileMeta.Path))
-				}
-			}
-
-			switch errors.Cause(err) {
-			case nil:
-				if !initializedColumns {
-					if len(cr.chunk.ColumnPermutation) == 0 {
-						if err = t.initializeColumns(columnNames, cr.chunk); err != nil {
-							return
-						}
-					}
-					filteredColumns = columnNames
-					ignoreColsMap := ignoreColumns.ColumnsMap()
-					if len(ignoreColsMap) > 0 || len(cr.chunk.FileMeta.ExtendData.Columns) > 0 {
-						filteredColumns, extendVals = filterColumns(columnNames, cr.chunk.FileMeta.ExtendData, ignoreColsMap, t.tableInfo.Core)
-					}
-					lastRow := cr.parser.LastRow()
-					lastRowLen := len(lastRow.Row)
-					extendColsMap := make(map[string]int)
-					for i, c := range cr.chunk.FileMeta.ExtendData.Columns {
-						extendColsMap[c] = lastRowLen + i
-					}
-					for i, col := range t.tableInfo.Core.Columns {
-						if p, ok := extendColsMap[col.Name.O]; ok {
-							cr.chunk.ColumnPermutation[i] = p
-						}
-					}
-					initializedColumns = true
-				}
-			case io.EOF:
-				reachEOF = true
-				break outLoop
-			default:
-				err = common.ErrEncodeKV.Wrap(err).GenWithStackByArgs(&cr.chunk.Key, newOffset)
-				return
-			}
-			readDur += time.Since(readDurStart)
-			encodeDurStart := time.Now()
-			lastRow := cr.parser.LastRow()
-			lastRow.Row = append(lastRow.Row, extendVals...)
-			// sql -> kv
-			kvs, encodeErr := kvEncoder.Encode(logger, lastRow.Row, lastRow.RowID, cr.chunk.ColumnPermutation, cr.chunk.Key.Path, curOffset)
-			encodeDur += time.Since(encodeDurStart)
-
-			hasIgnoredEncodeErr := false
-			if encodeErr != nil {
-				rowText := tidb.EncodeRowForRecord(ctx, t.encTable, rc.cfg.TiDB.SQLMode, lastRow.Row, cr.chunk.ColumnPermutation)
-				encodeErr = rc.errorMgr.RecordTypeError(ctx, logger, t.tableName, cr.chunk.Key.Path, newOffset, rowText, encodeErr)
-				if encodeErr != nil {
-					err = common.ErrEncodeKV.Wrap(encodeErr).GenWithStackByArgs(&cr.chunk.Key, newOffset)
-				}
-				hasIgnoredEncodeErr = true
-			}
-			cr.parser.RecycleRow(lastRow)
-			curOffset = newOffset
-
-			if err != nil {
-				return
-			}
-			if hasIgnoredEncodeErr {
-				continue
-			}
-
-			kvPacket = append(kvPacket, deliveredKVs{kvs: kvs, columns: filteredColumns, offset: newOffset,
-				rowID: rowID, realOffset: realOffset})
-			kvSize += kvs.Size()
-			failpoint.Inject("mock-kv-size", func(val failpoint.Value) {
-				kvSize += uint64(val.(int))
-			})
-			rc.status.TotalImportSize.Add(kvs.Size())
-			// pebble cannot allow > 4.0G kv in one batch.
-			// we will meet pebble panic when import sql file and each kv has the size larger than 4G / maxKvPairsCnt.
-			// so add this check.
-			if kvSize >= maxDeliverBytes || len(kvPacket) >= maxKvPairsCnt || newOffset == cr.chunk.Chunk.EndOffset {
-				canDeliver = true
-				kvSize = 0
-			}
-		}
-		encodeTotalDur += encodeDur
-		readTotalDur += readDur
-		if m, ok := metric.FromContext(ctx); ok {
-			m.RowEncodeSecondsHistogram.Observe(encodeDur.Seconds())
-			m.RowReadSecondsHistogram.Observe(readDur.Seconds())
-			m.RowReadBytesHistogram.Observe(float64(newOffset - offset))
-		}
-
-		if len(kvPacket) != 0 {
-			deliverKvStart := time.Now()
-			if err = send(kvPacket); err != nil {
-				return
-			}
-			if m, ok := metric.FromContext(ctx); ok {
-				m.RowKVDeliverSecondsHistogram.Observe(time.Since(deliverKvStart).Seconds())
-			}
-		}
-	}
-
-	err = send([]deliveredKVs{{offset: cr.chunk.Chunk.EndOffset, realOffset: cr.chunk.FileMeta.FileSize}})
-	return
-}
-
-func (cr *chunkRestore) restore(
-	ctx context.Context,
-	t *TableRestore,
-	engineID int32,
-	dataEngine, indexEngine *backend.LocalEngineWriter,
-	rc *Controller,
-) error {
-	// Create the encoder.
-	kvEncoder, err := rc.backend.NewEncoder(ctx, t.encTable, &kv.SessionOptions{
-		SQLMode:   rc.cfg.TiDB.SQLMode,
-		Timestamp: cr.chunk.Timestamp,
-		SysVars:   rc.sysVars,
-		// use chunk.PrevRowIDMax as the auto random seed, so it can stay the same value after recover from checkpoint.
-		AutoRandomSeed: cr.chunk.Chunk.PrevRowIDMax,
-	})
-	if err != nil {
-		return err
-	}
-	defer kvEncoder.Close()
-
-	kvsCh := make(chan []deliveredKVs, maxKVQueueSize)
-	deliverCompleteCh := make(chan deliverResult)
-
-	go func() {
-		defer close(deliverCompleteCh)
-		dur, err := cr.deliverLoop(ctx, kvsCh, t, engineID, dataEngine, indexEngine, rc)
-		select {
-		case <-ctx.Done():
-		case deliverCompleteCh <- deliverResult{dur, err}:
-		}
-	}()
-
-	logTask := t.logger.With(
-		zap.Int32("engineNumber", engineID),
-		zap.Int("fileIndex", cr.index),
-		zap.Stringer("path", &cr.chunk.Key),
-	).Begin(zap.InfoLevel, "restore file")
-
-	readTotalDur, encodeTotalDur, encodeErr := cr.encodeLoop(ctx, kvsCh, t, logTask.Logger, kvEncoder, deliverCompleteCh, rc)
-	var deliverErr error
-	select {
-	case deliverResult, ok := <-deliverCompleteCh:
-		if ok {
-			logTask.End(zap.ErrorLevel, deliverResult.err,
-				zap.Duration("readDur", readTotalDur),
-				zap.Duration("encodeDur", encodeTotalDur),
-				zap.Duration("deliverDur", deliverResult.totalDur),
-				zap.Object("checksum", &cr.chunk.Checksum),
-			)
-			deliverErr = deliverResult.err
-		} else {
-			// else, this must cause by ctx cancel
-			deliverErr = ctx.Err()
-		}
-	case <-ctx.Done():
-		deliverErr = ctx.Err()
-	}
-	return errors.Trace(firstErr(encodeErr, deliverErr))
-}
-
-func openReader(ctx context.Context, fileMeta mydump.SourceFileMeta, store storage.ExternalStorage) (
-	reader storage.ReadSeekCloser, err error) {
-	switch {
-	case fileMeta.Type == mydump.SourceTypeParquet:
-		reader, err = mydump.OpenParquetReader(ctx, store, fileMeta.Path, fileMeta.FileSize)
-	case fileMeta.Compression != mydump.CompressionNone:
-		compressType, err2 := mydump.ToStorageCompressType(fileMeta.Compression)
-		if err2 != nil {
-			return nil, err2
-		}
-		reader, err = storage.WithCompression(store, compressType).Open(ctx, fileMeta.Path)
-	default:
-		reader, err = store.Open(ctx, fileMeta.Path)
-	}
-	return
 }
 
 // check store liveness of tikv client-go requires GlobalConfig to work correctly, so we need to init it,
